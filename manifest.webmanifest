@@ -1,0 +1,67 @@
+{
+  "id": "./",
+  "name": "蝶迹 · 甲状腺健康记录",
+  "short_name": "蝶迹",
+  "description": "记录甲功指标与参考范围，查看趋势，管理每日状态、用药和复查，并生成就诊摘要。所有数据只保存在本机。",
+  "lang": "zh-CN",
+  "dir": "ltr",
+  "start_url": "./#/overview",
+  "scope": "./",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#f4f1e9",
+  "theme_color": "#123b34",
+  "categories": ["health", "medical", "productivity"],
+  "icons": [
+    {
+      "src": "assets/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "assets/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "assets/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "screenshots": [
+    {
+      "src": "screenshots/final-mobile-overview.png",
+      "sizes": "390x844",
+      "type": "image/png",
+      "form_factor": "narrow",
+      "label": "手机端总览"
+    },
+    {
+      "src": "screenshots/final-desktop-overview.png",
+      "sizes": "1440x1000",
+      "type": "image/png",
+      "form_factor": "wide",
+      "label": "桌面端总览"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "查看指标趋势",
+      "short_name": "趋势",
+      "url": "./#/trends",
+      "icons": [{ "src": "assets/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "查看检查记录",
+      "short_name": "记录",
+      "url": "./#/records",
+      "icons": [{ "src": "assets/icon-192.png", "sizes": "192x192" }]
+    }
+  ],
+  "prefer_related_applications": false
+}
