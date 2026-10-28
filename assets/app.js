@@ -21,6 +21,7 @@
      App state
      ------------------------------------------------------------------------ */
   let state = JK.data.loadState();
+  const initialLoadIssue = JK.data.getLoadStateIssue();
   let storageOK = true;
   try {
     const probe = '__jkc_probe__';
@@ -32,21 +33,26 @@
 
   if (!state) {
     state = JK.data.buildDemoState();
-    if (storageOK) JK.data.saveState(state);
+    // Do not overwrite a parser-recoverable raw record before the user has had
+    // a chance to preserve it from Settings.
+    if (storageOK && !(initialLoadIssue && initialLoadIssue.type === 'corrupt')) {
+      JK.data.saveState(state);
+    }
   }
 
   let currentRoute = '';
   let recordFilters = { query: '', onlyAbnormal: false };
   let trendState = { indicator: 'TSH', days: 365 };
   let chartInstances = [];
+  let chartAnimationDisabled = false;
   let modalStack = [];
   let toastTimer = null;
-  let currentPageData = {};
 
   const appEl = document.getElementById('app');
   const modalRoot = document.getElementById('modalRoot');
   const toastRegion = document.getElementById('toastRegion');
   const demoBanner = document.getElementById('demoBanner');
+  const storageIssueBanner = document.getElementById('storageIssueBanner');
 
   /* ------------------------------------------------------------------------
      Generic helpers
@@ -115,10 +121,6 @@
     return trimmed.slice(0, 1).toUpperCase();
   }
 
-  function plural(count, unit) {
-    return `${count}${unit || ''}`;
-  }
-
   function statusPill(status, indicatorKey, extraClass) {
     const tone = M.statusTone(status);
     const label = M.statusCopy(status, indicatorKey);
@@ -127,10 +129,12 @@
 
   function toneForStatus(status) { return M.statusTone(status); }
 
-  function statusDot(status, indicatorKey) {
-    const tone = M.statusTone(status);
-    const label = M.statusCopy(status, indicatorKey);
-    return `<span class="inline-status tone-${tone}" title="${esc(label)}"><span class="status-dot"></span>${esc(label)}</span>`;
+  function coreResultPill(summary, detailed) {
+    if (!summary || !summary.total) return '<span class="result-pill neutral">无核心指标</span>';
+    if (summary.out > 0) {
+      return `<span class="result-pill watch">${summary.out} 项${detailed ? '核心指标' : ''}偏离</span>`;
+    }
+    return '<span class="result-pill good">核心指标参考内</span>';
   }
 
   function deltaMarkup(indicatorKey, latestValue, previousValue, unit) {
@@ -141,10 +145,6 @@
     const direction = diff > 0 ? '↑' : '↓';
     const valueText = U.formatNumber(Math.abs(diff), indicatorKey);
     return `<span class="delta-value"><span class="delta-arrow">${direction}</span>${valueText}${unit ? `<span class="delta-unit">${esc(unit)}</span>` : ''}<span class="delta-label">较上次</span></span>`;
-  }
-
-  function avatarMarkup(size) {
-    return `<span class="avatar${size ? ' avatar-' + size : ''}">${esc(initials(state.profile.name))}</span>`;
   }
 
   function button(action, label, options) {
@@ -194,17 +194,6 @@
       </header>`;
   }
 
-  function formatRangeWithUnit(record, key) {
-    const ref = M.getReference(record, key);
-    const meta = INDICATORS[key];
-    return `${U.formatRange(ref.low, ref.high, key)} ${meta.unit}`;
-  }
-
-  function sameYear(dateKeyValue) {
-    const d = U.fromDateKey(dateKeyValue);
-    return d && d.getFullYear() === new Date().getFullYear();
-  }
-
   /* ------------------------------------------------------------------------
      Chrome: sidebar, demo state, active navigation
      ------------------------------------------------------------------------ */
@@ -236,6 +225,18 @@
       if (el) el.hidden = !demo;
     });
     if (demoBanner) demoBanner.hidden = !demo;
+    if (storageIssueBanner) {
+      const hasCorruptIssue = Boolean(initialLoadIssue && initialLoadIssue.type === 'corrupt');
+      storageIssueBanner.hidden = !hasCorruptIssue;
+      if (hasCorruptIssue) {
+        const copy = storageIssueBanner.querySelector('[data-storage-issue-copy]');
+        if (copy) {
+          copy.textContent = initialLoadIssue.recoverySaved
+            ? '本地记录读取失败。原始内容已在「个人与设置」中保留，可下载恢复副本后再继续录入。'
+            : '本地记录读取失败，且浏览器未能保留原始副本。建议先导出当前可见数据，再继续。';
+        }
+      }
+    }
 
     document.querySelectorAll('[data-nav]').forEach((link) => {
       const nav = link.getAttribute('data-nav');
@@ -660,32 +661,37 @@
     return `
       <section class="card recent-records">
         ${heading}
-        <div class="lab-table" role="table" aria-label="最近检查记录">
-          <div class="lab-table-head" role="row">
+        <div class="lab-table" aria-label="最近检查记录">
+          <div class="lab-table-head" aria-hidden="true">
             <span>检查日期</span><span>医院 / 实验室</span><span>TSH</span><span>FT4</span><span>FT3</span><span class="result-column">结果</span><span></span>
           </div>
           ${records.map((record) => {
             const summary = M.corePanelSummary(record);
+            const metricLabel = PRIMARY_INDICATORS
+              .filter((key) => M.getEntry(record, key))
+              .map((key) => `${key} ${U.formatNumber(M.getValue(record, key), key)}`)
+              .join('，');
+            const resultLabel = !summary.total ? '无核心指标' : summary.out > 0 ? `${summary.out} 项核心指标偏离参考范围` : '核心指标在参考范围内';
             return `
-              <button type="button" class="lab-table-row" role="row" data-action="open-record" data-id="${esc(record.id)}" aria-label="${esc(pageDateLabel(record.date))} 检查详情">
-                <span class="lab-date-cell" role="cell">
+              <button type="button" class="lab-table-row" data-action="open-record" data-id="${esc(record.id)}" aria-label="${esc(`${pageDateLabel(record.date)}，${record.hospital || '未填写医院'}，${metricLabel || '未填核心指标'}，${resultLabel}。打开检查详情`)}">
+                <span class="lab-date-cell">
                   <strong>${U.fromDateKey(record.date).getDate()}</strong>
                   <span>${U.fromDateKey(record.date).getMonth() + 1}月 · ${U.weekdayCN(record.date)}</span>
                 </span>
-                <span class="lab-provider-cell" role="cell">
+                <span class="lab-provider-cell">
                   <strong>${esc(record.hospital || '未填写医院')}</strong>
                   <small>${esc(relativeDate(record.date))}</small>
                 </span>
                 ${PRIMARY_INDICATORS.map((key) => {
                   const value = M.getValue(record, key);
                   const status = M.entryStatus(record, key);
-                  return `<span class="lab-number-cell metric-${key}" role="cell">
+                  return `<span class="lab-number-cell metric-${key}">
                     <span class="cell-mobile-label">${key}</span>
                     <span class="cell-number">${U.formatNumber(value, key)}<i class="status-dot tone-${toneForStatus(status)}"></i></span>
                   </span>`;
                 }).join('')}
-                <span class="lab-result-cell" role="cell">${summary.out > 0 ? `<span class="result-pill watch">${summary.out} 项偏离</span>` : `<span class="result-pill good">参考内</span>`}</span>
-                <span class="row-chevron" role="cell">${icon('chevron-right')}</span>
+                <span class="lab-result-cell">${coreResultPill(summary)}</span>
+                <span class="row-chevron">${icon('chevron-right')}</span>
               </button>`;
           }).join('')}
         </div>
@@ -701,9 +707,8 @@
     const meta = INDICATORS[key];
     const allPoints = M.seriesFor(state, key, 0);
     const points = M.seriesFor(state, key, trendState.days || 0);
-    const latestPoint = allPoints[allPoints.length - 1] || null;
-    const previousPoint = allPoints.length > 1 ? allPoints[allPoints.length - 2] : null;
-    const latestRecordObj = latestPoint ? state.records.find((record) => record.id === latestPoint.recordId) : null;
+    const latestPoint = points[points.length - 1] || null;
+    const previousPoint = points.length > 1 ? points[points.length - 2] : null;
     const latestAllRecord = M.latestRecord(state);
     const primaryTabs = PRIMARY_INDICATORS.map((tabKey) => {
       const tabMeta = INDICATORS[tabKey];
@@ -724,8 +729,8 @@
     ].map((range) => `<button type="button" class="${trendState.days === range.days ? 'is-active' : ''}" data-action="set-trend-range" data-days="${range.days}" aria-pressed="${trendState.days === range.days}">${range.label}</button>`).join('');
 
     const changeText = (() => {
-      if (!latestPoint) return '<span class="muted">还没有记录</span>';
-      if (!previousPoint) return '<span class="muted">首次记录</span>';
+      if (!latestPoint) return '<span class="muted">此时段内没有记录</span>';
+      if (!previousPoint) return '<span class="muted">时段内首次记录</span>';
       return deltaMarkup(key, latestPoint.value, previousPoint.value, meta.unit);
     })();
     const head = pageHead({
@@ -770,7 +775,7 @@
               <span class="chart-highlight-label">最新</span>
               <strong class="chart-highlight-value">${latestPoint ? U.formatNumber(latestPoint.value, key) : '—'}<span>${esc(meta.unit)}</span></strong>
               ${latestPoint ? statusPill(latestPoint.status, key) : ''}
-              <span class="chart-highlight-meta">${latestPoint ? `记于 ${esc(relativeDate(latestPoint.date))} · ${changeText}` : '等待第一次记录'}</span>
+              <span class="chart-highlight-meta">${latestPoint ? `记于 ${esc(relativeDate(latestPoint.date))} · ${changeText}` : (allPoints.length ? '所选时间范围内暂无记录，试试更长时间范围' : '等待第一次记录')}</span>
             </div>
             ${points.length
               ? '<div class="chart-canvas main-trend-chart" id="trendMainChart"></div>'
@@ -782,8 +787,8 @@
                 </div>`}
             ${points.length ? `
               <div class="chart-notes-row">
-                <span>${icon('info')}参考范围：${U.formatRange((latestPoint || allPoints[allPoints.length - 1] || {}).low, (latestPoint || allPoints[allPoints.length - 1] || {}).high, key)} ${esc(meta.unit)}</span>
-                <span>点击折线上的圆点可回看化验单</span>
+                <span>${icon('info')}参考范围：${U.formatRange(latestPoint.low, latestPoint.high, key)} ${esc(meta.unit)}</span>
+                <span>点击数据点可回看化验单</span>
               </div>` : ''}
             <div class="chart-explainer">
               <span class="chart-explainer-mark">i</span>
@@ -799,7 +804,7 @@
             </section>
           </aside>
         </div>
-        ${renderIndicatorHistory(key, meta, allPoints)}
+        ${renderIndicatorHistory(key, meta)}
       </div>`;
   }
 
@@ -859,7 +864,7 @@
     if (!allPoints.length) {
       return `<div class="empty-block empty-block-compact compact-no-icon"><h3>等待第一条记录</h3><p>有了数据之后，这里会帮你整理变化。</p></div>`;
     }
-    const inRange = allPoints.filter((point) => point.status === 'in-range').length;
+    const inRange = points.filter((point) => point.status === 'in-range').length;
     const first = points[0] || null;
     const last = points[points.length - 1] || null;
     const periodChange = first && last && first !== last ? last.value - first.value : null;
@@ -870,7 +875,7 @@
           <span>所选时段记录</span><strong>${points.length}<small>次</small></strong>
         </div>
         <div class="trend-fact">
-          <span>参考范围内</span><strong>${inRange}<small>/ ${allPoints.length} 次</small></strong>
+          <span>所选时段参考内</span><strong>${points.length ? `${inRange}<small>/ ${points.length} 次</small>` : '—'}</strong>
         </div>
         <div class="trend-fact">
           <span>时段内变化</span>
@@ -880,7 +885,7 @@
       <div class="trend-ref-note"><span>本次参考范围</span><strong>${U.formatRange(ref.low, ref.high, key)} ${esc(meta.unit)}</strong></div>`;
   }
 
-  function renderIndicatorHistory(key, meta, points) {
+  function renderIndicatorHistory(key, meta) {
     const records = M.recordsWithIndicator(state, key);
     if (!records.length) {
       return `<section class="card indicator-history">
@@ -892,20 +897,20 @@
     return `
       <section class="card indicator-history">
         ${cardHeader(`${meta.short} 历史记录`, `${records.length} 次`, `<a class="mini-link" href="#/records">全部检查 ${icon('arrow-right')}</a>`, 'records')}
-        <div class="history-table" role="table" aria-label="${esc(meta.name)}历史记录">
-          <div class="history-head" role="row"><span>检查日期</span><span>结果</span><span>参考范围</span><span>状态</span><span>较上次</span></div>
+        <div class="history-table" aria-label="${esc(meta.name)}历史记录">
+          <div class="history-head" aria-hidden="true"><span>检查日期</span><span>结果</span><span>参考范围</span><span>状态</span><span>较上次</span></div>
           ${rows.map((record, index) => {
             const value = M.getValue(record, key);
             const status = M.entryStatus(record, key);
             const ref = M.getReference(record, key);
             const previous = rows[index + 1] ? M.getValue(rows[index + 1], key) : null;
             return `
-              <button type="button" class="history-row" role="row" data-action="open-record" data-id="${esc(record.id)}">
-                <span class="history-date" role="cell"><strong>${esc(pageDateLabel(record.date))}</strong><small>${esc(record.hospital || '未填写医院')}</small></span>
-                <span class="history-value" role="cell">${U.formatNumber(value, key)}<small>${esc(meta.unit)}</small></span>
-                <span class="history-ref" role="cell">${U.formatRange(ref.low, ref.high, key)}</span>
-                <span role="cell">${statusPill(status, key)}</span>
-                <span class="history-delta" role="cell">${deltaMarkup(key, value, previous, meta.unit)}</span>
+              <button type="button" class="history-row" data-action="open-record" data-id="${esc(record.id)}" aria-label="${esc(`${pageDateLabel(record.date)}，${record.hospital || '未填写医院'}，${key} ${U.formatNumber(value, key)} ${meta.unit}，参考 ${U.formatRange(ref.low, ref.high, key)}，${M.statusCopy(status, key)}。打开检查详情`)}">
+                <span class="history-date"><strong>${esc(pageDateLabel(record.date))}</strong><small>${esc(record.hospital || '未填写医院')}</small></span>
+                <span class="history-value">${U.formatNumber(value, key)}<small>${esc(meta.unit)}</small></span>
+                <span class="history-ref">${U.formatRange(ref.low, ref.high, key)}</span>
+                <span>${statusPill(status, key)}</span>
+                <span class="history-delta">${deltaMarkup(key, value, previous, meta.unit)}</span>
               </button>`;
           }).join('')}
         </div>
@@ -951,10 +956,10 @@
               <input id="recordSearch" type="search" value="${esc(recordFilters.query)}" placeholder="搜索医院、备注或指标" aria-label="搜索检查记录">
             </label>
             <div class="filter-pills" role="group" aria-label="筛选检查记录">
-              <button type="button" class="${!recordFilters.onlyAbnormal ? 'is-active' : ''}" data-action="filter-records" data-mode="all">全部 <span>${all.length}</span></button>
-              <button type="button" class="${recordFilters.onlyAbnormal ? 'is-active' : ''}" data-action="filter-records" data-mode="abnormal">有偏离 <span>${abnormalCount}</span></button>
+              <button type="button" class="${!recordFilters.onlyAbnormal ? 'is-active' : ''}" data-action="filter-records" data-mode="all" aria-pressed="${!recordFilters.onlyAbnormal}">全部 <span>${all.length}</span></button>
+              <button type="button" class="${recordFilters.onlyAbnormal ? 'is-active' : ''}" data-action="filter-records" data-mode="abnormal" aria-pressed="${recordFilters.onlyAbnormal}">有偏离 <span>${abnormalCount}</span></button>
             </div>
-            <span class="record-result-count" id="recordCountText">${all.filter(recordMatches).length} 条记录</span>
+            <span class="record-result-count" id="recordCountText" aria-live="polite">${all.filter(recordMatches).length} 条记录</span>
           </div>
         </section>
         <div id="recordList">${renderRecordList()}</div>
@@ -1002,7 +1007,7 @@
           <span class="record-card-topline">
             <span class="record-card-hospital">${esc(record.hospital || '未填写医院 / 实验室')}</span>
             <span class="record-relative">${esc(relativeDate(record.date))}</span>
-            ${summary.out > 0 ? `<span class="result-pill watch">${summary.out} 项偏离</span>` : `<span class="result-pill good">核心指标参考内</span>`}
+            ${coreResultPill(summary)}
           </span>
           <span class="record-metrics">
             ${PRIMARY_INDICATORS.map((key) => {
@@ -1175,7 +1180,9 @@
           </div>
           ${med.instruction ? `<p class="med-instruction">${esc(med.instruction)}</p>` : ''}
           <div class="medication-foot">
-            <span>${med.startDate ? `开始于 ${esc(pageDateLabel(med.startDate))}` : '未记录开始日期'}</span>
+            <span>${med.active === false && med.endDate
+              ? `停用于 ${esc(pageDateLabel(med.endDate))}`
+              : med.startDate ? `开始于 ${esc(pageDateLabel(med.startDate))}` : '未记录开始日期'}</span>
             <div class="med-actions">
               <button type="button" class="text-button" data-action="edit-med" data-id="${esc(med.id)}">编辑</button>
               <button type="button" class="text-button ${med.active === false ? '' : 'danger-text'}" data-action="toggle-med-active" data-id="${esc(med.id)}">${med.active === false ? '恢复使用' : '标记停用'}</button>
@@ -1189,7 +1196,7 @@
         <button type="button" class="add-medication-card" data-action="new-med">
           <span>${icon('plus')}</span>
           <strong>添加药物</strong>
-          <p>按医生开具的方案记录</p>
+          <span class="add-medication-note">按医生开具的方案记录</span>
         </button>
       </div>
       ${inactive.length ? `<details class="inactive-meds"><summary>已停用药物 · ${inactive.length} 种 <span>${icon('chevron-down')}</span></summary><div class="medication-grid">${inactive.map(cardFor).join('')}</div></details>` : ''}`;
@@ -1237,7 +1244,9 @@
      VISITS PAGE
      ------------------------------------------------------------------------ */
   function renderVisits() {
-    const visit = M.upcomingVisit(state);
+    const future = M.upcomingVisits(state);
+    const visit = future[0] || null;
+    const laterVisits = future.slice(1);
     const past = M.pastVisits(state);
     const head = pageHead({
       eyebrow: '复查与就诊 · 提前准备',
@@ -1259,6 +1268,15 @@
                   action: button('new-visit', '安排复查', { variant: 'primary', icon: 'plus' })
                 })}
               </section>`}
+            ${laterVisits.length ? `<section class="future-visits-section">
+              <div class="section-heading">
+                <div><span class="section-kicker">UPCOMING</span><h2>后续安排</h2></div>
+                <span class="section-meta">${laterVisits.length} 项</span>
+              </div>
+              <div class="future-visits-list">
+                ${laterVisits.map(renderFutureVisit).join('')}
+              </div>
+            </section>` : ''}
             <section class="past-visits-section">
               <div class="section-heading">
                 <div><span class="section-kicker">VISIT HISTORY</span><h2>过往就诊</h2></div>
@@ -1335,6 +1353,22 @@
           <button type="button" class="btn btn-secondary btn-sm" data-action="edit-visit" data-id="${esc(visit.id)}">编辑复查安排</button>
         </div>
       </section>`;
+  }
+
+  function renderFutureVisit(visit) {
+    const date = U.fromDateKey(visit.date);
+    return `
+      <article class="future-visit">
+        <span class="future-visit-date">
+          <span>${U.englishMonth(visit.date)}</span>
+          <strong>${date.getDate()}</strong>
+        </span>
+        <span class="future-visit-copy">
+          <strong>${esc(visit.type || '内分泌科复查')}</strong>
+          <span>${esc(pageDateLabel(visit.date))}${visit.time ? ` · ${esc(visit.time)}` : ''}${visit.hospital ? ` · ${esc(visit.hospital)}` : ''}</span>
+        </span>
+        <button type="button" class="icon-btn icon-btn-small" data-action="edit-visit" data-id="${esc(visit.id)}" aria-label="编辑${esc(visit.type || '复查')}">${icon('edit')}</button>
+      </article>`;
   }
 
   function renderPastVisit(visit) {
@@ -1417,7 +1451,9 @@
                         return `<td class="report-value tone-${toneForStatus(status)}">${U.formatNumber(M.getValue(record, key), key)}<span class="print-dot"></span></td>`;
                       }).join('')}
                       <td>${M.getValue(record, 'TRAb') !== null ? U.formatNumber(M.getValue(record, 'TRAb'), 'TRAb') : '—'}</td>
-                      <td><span class="print-status ${summary.out > 0 ? 'watch' : 'good'}">${summary.out > 0 ? `${summary.out} 项偏离` : '参考内'}</span></td>
+                      <td>${summary.total === 0
+                        ? '<span class="print-status neutral">无核心指标</span>'
+                        : `<span class="print-status ${summary.out > 0 ? 'watch' : 'good'}">${summary.out > 0 ? `${summary.out} 项偏离` : '参考内'}</span>`}</td>
                     </tr>`;
                   }).join('')}
                 </tbody>
@@ -1695,6 +1731,7 @@
     };
     const bytes = U.estimateBytes(state);
     const sizeText = bytes > 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+    const recoveryAvailable = Boolean(JK.data.getRecoveryRaw());
     const head = pageHead({
       eyebrow: '个人与设置 · 数据属于你',
       title: '个人与设置',
@@ -1756,11 +1793,16 @@
                 <div><strong>${sizeText}</strong><span>本地占用</span></div>
               </div>
               <div class="data-actions">
-                <button type="button" class="data-action" data-action="export-json">${icon('download')}<div><strong>导出完整备份</strong><span>包含所有记录与档案的 JSON 文件</span></div>${icon('chevron-right')}</button>
-                <button type="button" class="data-action" data-action="export-csv">${icon('file')}<div><strong>导出化验 CSV</strong><span>适合在 Excel 中查看的指标明细</span></div>${icon('chevron-right')}</button>
-                <button type="button" class="data-action" data-action="import-json">${icon('upload')}<div><strong>从备份导入</strong><span>用之前的 JSON 备份覆盖当前数据</span></div>${icon('chevron-right')}</button>
+                <button type="button" class="data-action" data-action="export-json">${icon('download')}<span class="data-action-copy"><strong>导出完整备份</strong><span>包含所有记录与档案的 JSON 文件</span></span>${icon('chevron-right')}</button>
+                <button type="button" class="data-action" data-action="export-csv">${icon('file')}<span class="data-action-copy"><strong>导出化验 CSV</strong><span>适合在 Excel 中查看的指标明细</span></span>${icon('chevron-right')}</button>
+                <button type="button" class="data-action" data-action="import-json">${icon('upload')}<span class="data-action-copy"><strong>从备份导入</strong><span>用之前的 JSON 备份覆盖当前数据</span></span>${icon('chevron-right')}</button>
                 <input type="file" id="importFile" accept=".json,application/json" hidden>
               </div>
+              ${recoveryAvailable ? `<div class="data-recovery">
+                <span class="data-recovery-icon">${icon('alert')}</span>
+                <div><strong>发现一份无法读取的本地数据副本</strong><p>应用当前使用临时数据。原始内容仍保留在本机，可先下载留档。</p></div>
+                <button type="button" class="btn btn-ghost btn-sm" data-action="export-recovery">下载恢复副本</button>
+              </div>` : ''}
               <div class="data-danger">
                 <div>
                   <h3>数据管理</h3>
@@ -1790,7 +1832,7 @@
             <section class="card about-panel">
               <div class="about-brand"><span class="footer-mark">${icon('activity')}</span><div><strong>蝶迹</strong><span>THYROID CARE</span></div></div>
               <p>一个安静、清楚、尊重隐私的甲亢记录工具。</p>
-              <div class="about-row"><span>版本</span><strong>1.2.0 · 本地优先</strong></div>
+              <div class="about-row"><span>版本</span><strong>1.3.0 · 本地优先</strong></div>
               <div class="about-row"><span>数据位置</span><strong>当前浏览器</strong></div>
               <div class="about-row"><span>医疗内容</span><strong>患者教育参考</strong></div>
               <p class="about-disclaimer">本应用不提供诊断、处方或治疗调整建议，不能替代专业医疗照护。如出现紧急症状，请及时就医。</p>
@@ -1825,6 +1867,7 @@
     const routeChanged = nextRoute !== currentRoute;
     if (routeChanged && modalStack.length) closeAllModals();
     cleanupCharts();
+    chartAnimationDisabled = opts.animateCharts === false;
     currentRoute = nextRoute;
     const renderer = pages[currentRoute] || renderOverview;
     appEl.innerHTML = renderer();
@@ -1858,6 +1901,7 @@
         showXAxis: true,
         showYAxis: false,
         reference: ref,
+        animate: !chartAnimationDisabled,
         onSelect: (point) => openRecordDetails(point.recordId)
       });
     }
@@ -1878,6 +1922,7 @@
         showYAxis: true,
         reference: { low: latestPoint.low, high: latestPoint.high },
         emptyText: '这个时间范围内还没有记录',
+        animate: !chartAnimationDisabled,
         onSelect: (point) => openRecordDetails(point.recordId)
       });
     }
@@ -1899,7 +1944,8 @@
           showReference: true,
           showXAxis: true,
           showYAxis: false,
-          reference: { low: latestPoint.low, high: latestPoint.high }
+          reference: { low: latestPoint.low, high: latestPoint.high },
+          animate: !chartAnimationDisabled
         });
       });
     }
@@ -2059,6 +2105,7 @@
       errorEl.className = 'form-error';
       form.prepend(errorEl);
     }
+    errorEl.setAttribute('role', 'alert');
     errorEl.innerHTML = `${icon('alert')}<span></span>`;
     errorEl.querySelector('span').textContent = message;
     errorEl.hidden = false;
@@ -2093,7 +2140,7 @@
 
   function finishInlineUpdate(message) {
     const ok = persist(true);
-    renderRoute({ preserveScroll: true, silent: true });
+    renderRoute({ preserveScroll: true, silent: true, animateCharts: false });
     if (!ok) showToast('浏览器无法写入本地存储，记录可能不会保留。', 'error', 6000);
     else if (message) showToast(message, 'success', 1800);
     return ok;
@@ -2244,7 +2291,7 @@
   function saveLabForm(form) {
     const formData = new FormData(form);
     const date = String(formData.get('recordDate') || '');
-    if (!date) return showFormError(form, '请选择检查日期。');
+    if (!U.isValidDateKey(date)) return showFormError(form, '请选择有效的检查日期。');
     if (date > todayKey()) return showFormError(form, '检查日期不能晚于今天。');
     const panel = {};
     for (const key of INDICATOR_ORDER) {
@@ -2318,9 +2365,9 @@
         <section class="form-section">
           <div class="form-section-heading"><h3>今天的身体数据</h3><span>选填</span></div>
           <div class="vitals-form-grid">
-            <label class="vitals-input"><span class="vitals-input-icon">${icon('heart')}</span><div><span>静息心率</span><div class="inline-input"><input type="number" name="dailyHeartRate" min="25" max="250" step="1" value="${entry.heartRate || ''}" placeholder="—"><small>bpm</small></div></div></label>
-            <label class="vitals-input"><span class="vitals-input-icon">${icon('scale')}</span><div><span>体重</span><div class="inline-input"><input type="number" name="dailyWeight" min="20" max="300" step="0.1" value="${entry.weight || ''}" placeholder="—"><small>kg</small></div></div></label>
-            <label class="vitals-input"><span class="vitals-input-icon">${icon('moon')}</span><div><span>睡眠时长</span><div class="inline-input"><input type="number" name="dailySleep" min="0" max="24" step="0.1" value="${entry.sleepHours || ''}" placeholder="—"><small>小时</small></div></div></label>
+            <label class="vitals-input"><span class="vitals-input-icon">${icon('heart')}</span><span class="vitals-input-copy"><span>静息心率</span><span class="inline-input"><input type="number" name="dailyHeartRate" min="25" max="250" step="1" value="${entry.heartRate || ''}" placeholder="—"><small>bpm</small></span></span></label>
+            <label class="vitals-input"><span class="vitals-input-icon">${icon('scale')}</span><span class="vitals-input-copy"><span>体重</span><span class="inline-input"><input type="number" name="dailyWeight" min="20" max="300" step="0.1" value="${entry.weight || ''}" placeholder="—"><small>kg</small></span></span></label>
+            <label class="vitals-input"><span class="vitals-input-icon">${icon('moon')}</span><span class="vitals-input-copy"><span>睡眠时长</span><span class="inline-input"><input type="number" name="dailySleep" min="0" max="24" step="0.1" value="${entry.sleepHours || ''}" placeholder="—"><small>小时</small></span></span></label>
           </div>
         </section>
         <section class="form-section">
@@ -2484,10 +2531,16 @@
     if (!times.length) return showFormError(form, '请至少填写一个服药时间。');
     if (times.length > 3) return showFormError(form, '最多记录三个服药时间，请分开添加其他药物。');
     const startDate = String(formData.get('medStartDate') || '');
-    if (!startDate) return showFormError(form, '请选择开始日期。');
+    if (!U.isValidDateKey(startDate)) return showFormError(form, '请选择有效的开始日期。');
     const existingId = String(formData.get('medId') || '');
     const existing = existingId ? state.medications.find((item) => item.id === existingId) : null;
     const amount = String(formData.get('medAmount') || '').trim();
+    const active = Boolean(formData.get('medActive'));
+    let endDate = '';
+    if (!active) {
+      if (existing && existing.active === false) endDate = existing.endDate || '';
+      else endDate = startDate > todayKey() ? startDate : todayKey();
+    }
     const med = {
       id: existing ? existing.id : U.uid('med'),
       name,
@@ -2497,7 +2550,8 @@
       schedule: times.map((time) => ({ time, amount: amount || '按医嘱' })),
       instruction: String(formData.get('medInstruction') || '').trim(),
       startDate,
-      active: Boolean(formData.get('medActive')),
+      endDate,
+      active,
       note: String(formData.get('medNote') || '').trim()
     };
     if (existing) {
@@ -2565,18 +2619,27 @@
   function saveVisitForm(form) {
     const formData = new FormData(form);
     const date = String(formData.get('visitDate') || '');
-    if (!date) return showFormError(form, '请选择复查日期。');
+    if (!U.isValidDateKey(date)) return showFormError(form, '请选择有效的复查日期。');
     const existingId = String(formData.get('visitId') || '');
     const existing = existingId ? state.visits.find((item) => item.id === existingId) : null;
-    const prepLines = String(formData.get('visitPrep') || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const seenPrepText = new Set();
+    const prepLines = String(formData.get('visitPrep') || '').split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => {
+        if (!line || seenPrepText.has(line)) return false;
+        seenPrepText.add(line);
+        return true;
+      })
+      .slice(0, 20);
     const prep = prepLines.map((text) => {
       const matched = existing && (existing.prep || []).find((item) => item.text === text);
       return { id: matched ? matched.id : U.uid('prep'), text, done: matched ? Boolean(matched.done) : false };
     });
+    const visitTime = String(formData.get('visitTime') || '');
     const visit = {
       id: existing ? existing.id : U.uid('visit'),
       date,
-      time: String(formData.get('visitTime') || ''),
+      time: /^([01]\d|2[0-3]):[0-5]\d$/.test(visitTime) ? visitTime : '',
       type: String(formData.get('visitType') || '').trim() || '内分泌科复查',
       hospital: String(formData.get('visitHospital') || '').trim(),
       doctor: String(formData.get('visitDoctor') || '').trim(),
@@ -2616,7 +2679,7 @@
             <p>${esc(pageDateLabel(record.date))}${record.doctor ? ` · ${esc(record.doctor)}` : ''}${record.fasting ? ' · 空腹' : ''}</p>
           </div>
           <div class="record-detail-summary">
-            ${summary.out > 0 ? `<span class="result-pill watch">${summary.out} 项核心指标偏离</span>` : `<span class="result-pill good">核心指标参考内</span>`}
+            ${coreResultPill(summary, true)}
             <span>${entries.length} 项已记录</span>
           </div>
         </div>
@@ -2700,12 +2763,16 @@
         return showFormError(form, '出生年份需要是 1900 年到今年的四位数字。');
       }
     }
+    const diagnosedAt = String(formData.get('setupDiagnosedAt') || '');
+    if (diagnosedAt && (!U.isValidDateKey(diagnosedAt) || diagnosedAt > todayKey())) {
+      return showFormError(form, '确诊时间不能晚于今天。');
+    }
     state = JK.data.createEmptyState({
       name,
       sex: String(formData.get('setupSex') || ''),
       birthYear: birthYearRaw,
       diagnosis: String(formData.get('setupDiagnosis') || '').trim(),
-      diagnosedAt: String(formData.get('setupDiagnosedAt') || ''),
+      diagnosedAt,
       hospital: '',
       doctor: '',
       summaryQuestions: ''
@@ -2796,8 +2863,20 @@
     showToast('完整备份已生成。请妥善保存这个文件。', 'success');
   }
 
+  function exportRecovery() {
+    const raw = JK.data.getRecoveryRaw();
+    if (!raw) {
+      showToast('没有找到可下载的恢复副本。', 'warning');
+      return;
+    }
+    downloadFile(`蝶迹-无法读取的本地数据-${todayKey()}.json.txt`, raw, 'text/plain;charset=utf-8');
+    showToast('恢复副本已下载，可交给技术人员排查或尝试修复。', 'success');
+  }
+
   function csvCell(value) {
-    const text = String(value === null || value === undefined ? '' : value);
+    let text = String(value === null || value === undefined ? '' : value);
+    // Neutralise spreadsheet formulas when the CSV is opened in Excel.
+    if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
     return `"${text.replace(/"/g, '""')}"`;
   }
 
@@ -2824,6 +2903,7 @@
     const file = input.files && input.files[0];
     if (!file) return;
     try {
+      if (file.size > 5 * 1024 * 1024) throw new Error('备份文件超过 5 MB，无法导入。');
       const text = await file.text();
       let parsed;
       try { parsed = JSON.parse(text); }
@@ -2834,6 +2914,10 @@
       const normalized = JK.data.normalizeState(raw);
       if (!normalized) throw new Error('备份数据无法读取。');
       const recordCount = normalized.records.length;
+      const rawRecordCount = Array.isArray(raw.records) ? raw.records.length : 0;
+      if (rawRecordCount > 0 && recordCount === 0) {
+        throw new Error('备份中的检查记录格式无法识别，未导入任何数据。');
+      }
       const confirmed = await confirmDialog({
         title: '导入并覆盖当前数据？',
         eyebrow: '导入备份',
@@ -2844,10 +2928,14 @@
       if (!confirmed) return;
       state = normalized;
       recordFilters = { query: '', onlyAbnormal: false };
-      persist(true);
+      const writeOK = persist(true);
       closeAllModals();
       goTo('overview');
-      showToast(`已导入 ${recordCount} 条检查记录。`, 'success');
+      showToast(
+        writeOK ? `已导入 ${recordCount} 条检查记录。` : '数据已载入内存，但浏览器无法写入本地存储，请立即导出备份。',
+        writeOK ? 'success' : 'error',
+        writeOK ? 3600 : 8000
+      );
     } catch (error) {
       showToast(error.message || '导入失败，请检查文件格式。', 'error', 6000);
     } finally {
@@ -3017,9 +3105,11 @@
           });
           if (!confirmed) return;
           med.active = false;
+          med.endDate = todayKey();
           finishSave('已标记为停用，历史记录仍保留。');
         } else {
           med.active = true;
+          delete med.endDate;
           finishSave('已恢复为在用药物。');
         }
         break;
@@ -3072,13 +3162,14 @@
         break;
       case 'filter-records':
         recordFilters.onlyAbnormal = trigger.getAttribute('data-mode') === 'abnormal';
-        renderRoute({ preserveScroll: true, silent: true });
+        renderRoute({ preserveScroll: true, silent: true, animateCharts: false });
         break;
       case 'edit-summary-questions': openSummaryQuestionsModal(); break;
       case 'copy-summary': copySummary(); break;
       case 'print-summary': printSummary(); break;
       case 'export-json': exportJSON(); break;
       case 'export-csv': exportCSV(); break;
+      case 'export-recovery': exportRecovery(); break;
       case 'import-json': {
         const input = document.getElementById('importFile');
         if (input) input.click();
@@ -3104,10 +3195,10 @@
         state = JK.data.buildDemoState();
         recordFilters = { query: '', onlyAbnormal: false };
         trendState = { indicator: 'TSH', days: 365 };
-        persist(true);
+        const ok = persist(true);
         closeAllModals();
         goTo('overview');
-        showToast('已载入演示数据。', 'success');
+        showToast(ok ? '已载入演示数据。' : '演示数据已载入内存，但浏览器无法写入本地存储。', ok ? 'success' : 'error');
         break;
       }
       case 'clear-all': {
@@ -3115,17 +3206,18 @@
           title: '清空所有数据？',
           eyebrow: '不可撤销',
           message: '个人档案、检查记录、每日状态、用药与复查安排都将从这台设备上删除。',
-          detail: '这个操作不能撤销。如需保留任何内容，请先取消并导出备份。',
+          detail: '包括可能存在的恢复副本。这个操作不能撤销，如需保留任何内容，请先取消并导出备份。',
           confirmLabel: '确认清空'
         });
         if (!confirmed) return;
+        JK.data.clearRecovery();
         state = JK.data.createEmptyState({});
         recordFilters = { query: '', onlyAbnormal: false };
         trendState = { indicator: 'TSH', days: 365 };
-        persist(true);
+        const ok = persist(true);
         closeAllModals();
         goTo('overview');
-        showToast('本机数据已清空。', 'success');
+        showToast(ok ? '本机数据已清空。' : '界面已清空，但浏览器拒绝写入本地存储；请检查浏览器设置。', ok ? 'success' : 'error');
         break;
       }
       case 'start-fresh': openStartFreshModal(); break;
@@ -3161,11 +3253,15 @@
             return showFormError(form, '出生年份需要是 1900 年到今年的四位数字。');
           }
         }
+        const diagnosedAt = String(data.get('profileDiagnosedAt') || '');
+        if (diagnosedAt && (!U.isValidDateKey(diagnosedAt) || diagnosedAt > todayKey())) {
+          return showFormError(form, '确诊时间不能晚于今天。');
+        }
         state.profile = Object.assign({}, state.profile, {
           name: String(data.get('profileName') || '').trim(),
           sex: String(data.get('profileSex') || ''),
           birthYear,
-          diagnosedAt: String(data.get('profileDiagnosedAt') || ''),
+          diagnosedAt,
           diagnosis: String(data.get('profileDiagnosis') || '').trim(),
           hospital: String(data.get('profileHospital') || '').trim(),
           doctor: String(data.get('profileDoctor') || '').trim()
@@ -3313,6 +3409,8 @@
   renderRoute({ initial: true });
   if (!storageOK) {
     setTimeout(() => showToast('当前浏览器禁用了本地存储。数据可能无法保留，请先导出备份或更换浏览器设置。', 'warning', 8000), 700);
+  } else if (initialLoadIssue && initialLoadIssue.type === 'corrupt') {
+    setTimeout(() => showToast('本地记录读取失败。原始数据已在「个人与设置 → 数据与备份」中保留，可下载恢复副本。', 'error', 9000), 800);
   }
 
 })();

@@ -6,7 +6,6 @@
   'use strict';
 
   window.JK = window.JK || {};
-  const instances = [];
   let chartCounter = 0;
 
   const { formatNumber, formatMonthDay, formatDate, weekdayCN, fromDateKey, pad } = window.JK.utils;
@@ -56,8 +55,9 @@
   function formatTick(value) {
     if (Math.abs(value) >= 1000) return Math.round(value).toLocaleString('en-US');
     if (Math.abs(value) >= 100) return String(Math.round(value));
-    if (Math.abs(value) >= 10) return String(Number(value.toFixed(1)));
-    return String(Number(value.toFixed(2)));
+    if (Math.abs(value) >= 1) return String(Number(value.toFixed(2)));
+    if (value === 0) return '0';
+    return String(Number(value.toPrecision(2)));
   }
 
   function xLabel(date, spanDays) {
@@ -79,7 +79,6 @@
     let observer = null;
     let destroyed = false;
     let currentWidth = 0;
-    let lastPoints = null;
     let frame = null;
 
     function destroy() {
@@ -324,7 +323,7 @@
         path.setAttribute('stroke-linejoin', 'round');
         path.setAttribute('class', 'chart-line');
         svg.appendChild(path);
-        if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+        if (config.animate !== false && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
           requestAnimationFrame(() => {
             try {
               const length = path.getTotalLength();
@@ -457,10 +456,10 @@
       });
       svg.addEventListener('pointerleave', hideActive);
 
-      // A click on a point (or the chart area) opens that record.
+      // Only an explicit point (hover on desktop, tap on mobile) opens a record.
       svg.addEventListener('click', () => {
-        const index = activeIndex >= 0 ? activeIndex : positions.length - 1;
-        if (config.onSelect && positions[index]) config.onSelect(positions[index].point);
+        if (activeIndex < 0) return;
+        if (config.onSelect && positions[activeIndex]) config.onSelect(positions[activeIndex].point);
       });
       svg.addEventListener('touchstart', (event) => {
         const rect = svg.getBoundingClientRect();
@@ -478,8 +477,6 @@
 
       // Keep the latest point visible if a tooltip is open while resizing.
       if (activeIndex >= 0) setActive(Math.min(activeIndex, positions.length - 1));
-
-      lastPoints = points;
     }
 
     observer = new ResizeObserver((entries) => {
@@ -494,16 +491,8 @@
     // Draw synchronously after layout has settled.
     currentWidth = Math.floor(container.clientWidth);
     draw();
-    instances.push({ destroy });
-    return { destroy: destroy, get points() { return lastPoints; } };
+    return { destroy: destroy };
   }
 
-  function cleanup() {
-    instances.forEach((instance) => {
-      try { instance.destroy(); } catch (error) { /* already detached */ }
-    });
-    instances.length = 0;
-  }
-
-  JK.charts = { mountLineChart, cleanup };
+  JK.charts = { mountLineChart };
 })();

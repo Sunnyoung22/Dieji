@@ -1,7 +1,7 @@
 /* 蝶迹 service worker
    Network-first for same-origin GET requests, with an offline fallback from
    the app-shell cache. Online users always receive the latest deployment. */
-const CACHE_VERSION = 'dieji-app-v1.2.0';
+const CACHE_VERSION = 'dieji-app-v1.3.0';
 const APP_SHELL = [
   './',
   './index.html',

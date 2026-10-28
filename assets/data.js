@@ -145,11 +145,18 @@
   function todayKey() { return dateKey(new Date()); }
 
   function fromDateKey(key) {
-    if (!key || typeof key !== 'string') return null;
+    if (!key || typeof key !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(key)) return null;
     const parts = key.split('-').map(Number);
     if (parts.length !== 3 || parts.some(Number.isNaN)) return null;
     const d = new Date(parts[0], parts[1] - 1, parts[2], 12, 0, 0, 0);
-    return Number.isNaN(d.getTime()) ? null : d;
+    if (Number.isNaN(d.getTime())) return null;
+    // Reject rollovers such as 2026-02-31.
+    if (d.getFullYear() !== parts[0] || d.getMonth() !== parts[1] - 1 || d.getDate() !== parts[2]) return null;
+    return d;
+  }
+
+  function isValidDateKey(key) {
+    return typeof key === 'string' && fromDateKey(key) !== null;
   }
 
   function addDays(value, amount) {
@@ -166,29 +173,11 @@
     return Math.round((b.getTime() - a.getTime()) / DAY_MS);
   }
 
-  function relativeDayLabel(key, baseKey) {
-    const base = baseKey || todayKey();
-    const diff = daysBetween(base, key);
-    if (diff === null) return '';
-    if (diff === 0) return '今天';
-    if (diff === 1) return '明天';
-    if (diff === -1) return '昨天';
-    if (diff > 1 && diff <= 30) return `${diff} 天后`;
-    if (diff < -1 && diff >= -30) return `${Math.abs(diff)} 天前`;
-    return formatDate(key);
-  }
-
   function formatDate(key, options) {
     const d = fromDateKey(key);
     if (!d) return '—';
     const year = (options && options.year) !== false ? d.getFullYear() + '年' : '';
     return `${year}${d.getMonth() + 1}月${d.getDate()}日`;
-  }
-
-  function formatDateShort(key) {
-    const d = fromDateKey(key);
-    if (!d) return '—';
-    return `${pad(d.getMonth() + 1)}.${pad(d.getDate())}`;
   }
 
   function formatMonthDay(key) {
@@ -215,9 +204,16 @@
     if (!Number.isFinite(num)) return '—';
     const cfg = INDICATORS[key] || {};
     let digits = Number.isInteger(cfg.decimals) ? cfg.decimals : 2;
-    if (num !== 0 && Math.abs(num) < 1) digits = Math.max(digits, 2);
-    if (num !== 0 && Math.abs(num) < 0.1) digits = Math.max(digits, 3);
-    return num.toFixed(digits);
+    // Preserve precision the user actually entered (for example ALT 41.5),
+    // and never round a very small positive value down to 0.000.
+    const raw = String(num);
+    if (!/[eE]/.test(raw) && raw.includes('.')) {
+      digits = Math.max(digits, raw.split('.')[1].length);
+    }
+    if (num !== 0 && Math.abs(num) < 0.1) {
+      digits = Math.max(digits, Math.ceil(-Math.log10(Math.abs(num))));
+    }
+    return num.toFixed(Math.min(6, digits));
   }
 
   function formatRange(low, high, key) {
@@ -267,33 +263,323 @@
     };
   }
 
+  const RECOVERY_KEY = 'jkc_app_v1_recovery';
+  let loadStateIssue = null;
+
+  function isPlainObject(value) {
+    return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+  }
+
+  function cleanText(value, maxLength) {
+    if (value === null || value === undefined) return '';
+    return String(value).trim().slice(0, maxLength || 500);
+  }
+
+  function cleanNumber(value) {
+    if (value === null || value === undefined || typeof value === 'boolean') return null;
+    if (typeof value === 'string' && value.trim() === '') return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+
+  function cleanDate(value) {
+    const text = cleanText(value, 10);
+    return isValidDateKey(text) ? text : '';
+  }
+
+  function cleanTimestamp(value, fallbackDate) {
+    const date = new Date(value);
+    if (!Number.isNaN(date.getTime())) return date.toISOString();
+    return new Date(`${fallbackDate || todayKey()}T12:00:00`).toISOString();
+  }
+
+  function uniqueId(preferred, prefix, seen) {
+    let id = cleanText(preferred, 80) || uid(prefix);
+    let suffix = 2;
+    while (seen.has(id)) {
+      id = `${cleanText(preferred, 70) || prefix}_${suffix}`;
+      suffix += 1;
+    }
+    seen.add(id);
+    return id;
+  }
+
+  function sanitizeRanges(rawRanges) {
+    const ranges = defaultRanges();
+    if (!isPlainObject(rawRanges)) return ranges;
+    INDICATOR_ORDER.forEach((key) => {
+      const raw = rawRanges[key];
+      if (!isPlainObject(raw)) return;
+      const low = cleanNumber(raw.low);
+      const high = cleanNumber(raw.high);
+      if (low !== null && high !== null && low >= 0 && high > low) ranges[key] = { low, high };
+    });
+    return ranges;
+  }
+
+  function sanitizePanel(rawPanel, ranges) {
+    const panel = {};
+    if (!isPlainObject(rawPanel)) return panel;
+    INDICATOR_ORDER.forEach((key) => {
+      const raw = rawPanel[key];
+      if (!isPlainObject(raw)) return;
+      const value = cleanNumber(raw.value);
+      if (value === null || value < 0) return;
+      const fallback = ranges[key] || INDICATORS[key];
+      let low = cleanNumber(raw.low);
+      let high = cleanNumber(raw.high);
+      if (low === null || high === null || low < 0 || high <= low) {
+        low = fallback.low;
+        high = fallback.high;
+      }
+      panel[key] = { value, low, high, unit: INDICATORS[key].unit };
+    });
+    return panel;
+  }
+
+  function sanitizeProfile(rawProfile) {
+    const profile = rawProfile && isPlainObject(rawProfile) ? rawProfile : {};
+    const currentYear = new Date().getFullYear();
+    const birthYear = Number(profile.birthYear);
+    const validBirthYear = Number.isInteger(birthYear) && birthYear >= 1900 && birthYear <= currentYear
+      ? String(birthYear) : '';
+    return {
+      name: cleanText(profile.name, 24),
+      sex: cleanText(profile.sex, 24),
+      birthYear: validBirthYear,
+      diagnosis: cleanText(profile.diagnosis, 80),
+      diagnosedAt: cleanDate(profile.diagnosedAt),
+      hospital: cleanText(profile.hospital, 60),
+      doctor: cleanText(profile.doctor, 40),
+      summaryQuestions: cleanText(profile.summaryQuestions, 1200)
+    };
+  }
+
+  function sanitizeRecords(rawRecords, ranges) {
+    const records = [];
+    const seen = new Set();
+    if (!Array.isArray(rawRecords)) return records;
+    rawRecords.forEach((raw) => {
+      if (!isPlainObject(raw)) return;
+      const date = cleanDate(raw.date);
+      if (!date) return;
+      const panel = sanitizePanel(raw.panel, ranges);
+      if (!Object.keys(panel).length) return;
+      records.push({
+        id: uniqueId(raw.id, 'lab', seen),
+        date,
+        hospital: cleanText(raw.hospital, 60),
+        doctor: cleanText(raw.doctor, 40),
+        fasting: raw.fasting === true,
+        panel,
+        note: cleanText(raw.note, 500),
+        createdAt: cleanTimestamp(raw.createdAt, date)
+      });
+    });
+    return records;
+  }
+
+  function sanitizeDaily(rawDaily) {
+    const byDate = new Map();
+    if (!Array.isArray(rawDaily)) return [];
+    rawDaily.forEach((raw) => {
+      if (!isPlainObject(raw)) return;
+      const date = cleanDate(raw.date);
+      if (!date) return;
+      const symptoms = {};
+      SYMPTOMS.forEach((symptom) => {
+        const level = cleanNumber(raw.symptoms && raw.symptoms[symptom.key]);
+        symptoms[symptom.key] = level === null ? 0 : clamp(Math.round(level), 0, 3);
+      });
+      const heartRate = cleanNumber(raw.heartRate);
+      const weight = cleanNumber(raw.weight);
+      const sleepHours = cleanNumber(raw.sleepHours);
+      const flags = Array.isArray(raw.flags)
+        ? [...new Set(raw.flags.filter((flag) => FLAGS.some((item) => item.key === flag)))]
+        : [];
+      const feeling = FEELINGS.some((item) => item.key === raw.feeling) ? raw.feeling : 'okay';
+      const entry = {
+        id: cleanText(raw.id, 80) || uid('daily'),
+        date,
+        heartRate: heartRate !== null && heartRate >= 20 && heartRate <= 300 ? heartRate : null,
+        weight: weight !== null && weight >= 20 && weight <= 300 ? weight : null,
+        sleepHours: sleepHours !== null && sleepHours >= 0 && sleepHours <= 24 ? sleepHours : null,
+        symptoms,
+        flags,
+        feeling,
+        note: cleanText(raw.note, 400),
+        createdAt: cleanTimestamp(raw.createdAt, date)
+      };
+      const previous = byDate.get(date);
+      if (!previous || String(entry.createdAt) >= String(previous.createdAt)) byDate.set(date, entry);
+    });
+    return [...byDate.values()];
+  }
+
+  function sanitizeMedications(rawMedications) {
+    const medications = [];
+    const seen = new Set();
+    if (!Array.isArray(rawMedications)) return medications;
+    rawMedications.forEach((raw) => {
+      if (!isPlainObject(raw)) return;
+      const name = cleanText(raw.name, 60);
+      if (!name) return;
+      const seenTimes = new Set();
+      const schedule = [];
+      if (Array.isArray(raw.schedule)) {
+        raw.schedule.forEach((dose) => {
+          if (!isPlainObject(dose)) return;
+          const time = cleanText(dose.time, 5);
+          if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(time) || seenTimes.has(time)) return;
+          seenTimes.add(time);
+          schedule.push({
+            time,
+            amount: cleanText(dose.amount || raw.amount, 40) || '按医嘱'
+          });
+        });
+      }
+      schedule.sort((a, b) => a.time.localeCompare(b.time));
+      const startDate = cleanDate(raw.startDate);
+      let endDate = cleanDate(raw.endDate);
+      if (startDate && endDate && endDate < startDate) endDate = '';
+      medications.push({
+        id: uniqueId(raw.id, 'med', seen),
+        name,
+        brand: cleanText(raw.brand, 40),
+        category: cleanText(raw.category, 40) || '其他',
+        amount: cleanText(raw.amount, 40),
+        schedule,
+        instruction: cleanText(raw.instruction, 100),
+        startDate,
+        endDate,
+        active: raw.active !== false,
+        note: cleanText(raw.note, 300)
+      });
+    });
+    return medications;
+  }
+
+  function sanitizeVisits(rawVisits) {
+    const visits = [];
+    const seen = new Set();
+    if (!Array.isArray(rawVisits)) return visits;
+    rawVisits.forEach((raw) => {
+      if (!isPlainObject(raw)) return;
+      const date = cleanDate(raw.date);
+      if (!date) return;
+      const prep = [];
+      const prepIds = new Set();
+      if (Array.isArray(raw.prep)) {
+        raw.prep.forEach((item) => {
+          if (!isPlainObject(item)) return;
+          const text = cleanText(item.text, 200);
+          if (!text) return;
+          prep.push({
+            id: uniqueId(item.id, 'prep', prepIds),
+            text,
+            done: item.done === true
+          });
+        });
+      }
+      const time = cleanText(raw.time, 5);
+      visits.push({
+        id: uniqueId(raw.id, 'visit', seen),
+        date,
+        time: /^([01]\d|2[0-3]):[0-5]\d$/.test(time) ? time : '',
+        type: cleanText(raw.type, 60) || '内分泌科复查',
+        hospital: cleanText(raw.hospital, 60),
+        doctor: cleanText(raw.doctor, 40),
+        location: cleanText(raw.location, 80),
+        purpose: cleanText(raw.purpose, 120),
+        notes: cleanText(raw.notes, 500),
+        prep
+      });
+    });
+    return visits;
+  }
+
+  function sanitizeMedLogs(rawLogs) {
+    const logs = {};
+    if (!isPlainObject(rawLogs)) return logs;
+    Object.entries(rawLogs).forEach(([date, day]) => {
+      if (!isValidDateKey(date) || !isPlainObject(day)) return;
+      const cleanDay = {};
+      Object.entries(day).forEach(([key, value]) => {
+        if (typeof key !== 'string' || !key.includes('|')) return;
+        cleanDay[key] = isPlainObject(value) ? { ...value } : {};
+      });
+      if (Object.keys(cleanDay).length) logs[date] = cleanDay;
+    });
+    return logs;
+  }
+
   function normalizeState(raw) {
-    if (!raw || typeof raw !== 'object') return null;
-    const base = createEmptyState();
-    const state = Object.assign(base, raw);
-    state.version = APP_VERSION;
-    state.meta = Object.assign({ demo: false, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }, raw.meta || {});
-    state.profile = Object.assign(base.profile, raw.profile || {});
-    state.settings = Object.assign({ ranges: defaultRanges() }, raw.settings || {});
-    state.settings.ranges = Object.assign(defaultRanges(), state.settings.ranges || {});
-    state.records = Array.isArray(raw.records) ? raw.records.filter((r) => r && r.date && r.panel) : [];
-    state.daily = Array.isArray(raw.daily) ? raw.daily.filter((d) => d && d.date) : [];
-    state.medications = Array.isArray(raw.medications) ? raw.medications.filter((m) => m && m.name) : [];
-    state.visits = Array.isArray(raw.visits) ? raw.visits.filter((v) => v && v.date) : [];
-    state.medLogs = raw.medLogs && typeof raw.medLogs === 'object' ? raw.medLogs : {};
-    return state;
+    if (!isPlainObject(raw)) return null;
+    const fallback = createEmptyState();
+    const ranges = sanitizeRanges(raw.settings && raw.settings.ranges);
+    const now = new Date().toISOString();
+    return {
+      version: APP_VERSION,
+      meta: {
+        demo: Boolean(raw.meta && raw.meta.demo),
+        createdAt: cleanTimestamp(raw.meta && raw.meta.createdAt, todayKey()),
+        updatedAt: cleanTimestamp(raw.meta && raw.meta.updatedAt, todayKey())
+      },
+      profile: sanitizeProfile(raw.profile),
+      settings: { ranges },
+      records: sanitizeRecords(raw.records, ranges),
+      daily: sanitizeDaily(raw.daily),
+      medications: sanitizeMedications(raw.medications),
+      medLogs: sanitizeMedLogs(raw.medLogs),
+      visits: sanitizeVisits(raw.visits)
+    };
   }
 
   function loadState() {
+    loadStateIssue = null;
+    let raw = null;
     try {
-      const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (!raw) return null;
-      const parsed = JSON.parse(raw);
-      return normalizeState(parsed);
+      raw = window.localStorage.getItem(STORAGE_KEY);
     } catch (error) {
-      console.warn('无法读取本地数据，将使用演示数据。', error);
+      loadStateIssue = { type: 'unavailable', message: '浏览器不允许读取本地存储。' };
       return null;
     }
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw);
+      const normalized = normalizeState(parsed);
+      if (!normalized) throw new Error('无法识别的数据结构');
+      return normalized;
+    } catch (error) {
+      let recoverySaved = false;
+      try {
+        window.localStorage.setItem(RECOVERY_KEY, raw);
+        recoverySaved = true;
+      } catch (recoveryError) {
+        // The main store is already unreadable; nothing else can be done here.
+      }
+      loadStateIssue = {
+        type: 'corrupt',
+        message: '本地记录无法读取，已使用临时演示数据。',
+        recoverySaved
+      };
+      console.warn('本地记录解析失败。', error);
+      return null;
+    }
+  }
+
+  function getLoadStateIssue() {
+    return loadStateIssue ? { ...loadStateIssue } : null;
+  }
+
+  function getRecoveryRaw() {
+    try { return window.localStorage.getItem(RECOVERY_KEY) || ''; }
+    catch (error) { return ''; }
+  }
+
+  function clearRecovery() {
+    try { window.localStorage.removeItem(RECOVERY_KEY); return true; }
+    catch (error) { return false; }
   }
 
   function saveState(state) {
@@ -306,11 +592,6 @@
       console.warn('无法写入本地存储。', error);
       return false;
     }
-  }
-
-  function clearStoredState() {
-    try { window.localStorage.removeItem(STORAGE_KEY); return true; }
-    catch (error) { return false; }
   }
 
   /* ------------------------------------------------------------------------
@@ -649,35 +930,23 @@
       .map((d) => ({ date: d.date, value: Number(d[field]) }));
   }
 
-  function symptomLoad(entry) {
-    if (!entry || !entry.symptoms) return 0;
-    return Object.values(entry.symptoms).reduce((sum, value) => sum + (Number(value) || 0), 0);
-  }
-
-  function symptomCount(entry) {
-    if (!entry || !entry.symptoms) return 0;
-    return Object.values(entry.symptoms).filter((value) => Number(value) > 0).length;
-  }
-
-  function dateIsBetween(key, start, end) {
-    if (!key) return false;
-    if (start && key < start) return false;
-    if (end && key > end) return false;
+  /**
+   * A medication counts for a given date if it had started, and either:
+   * - is still active; or
+   * - was stopped later than that date (so historical adherence remains valid).
+   */
+  function medicationAppliesOn(med, key) {
+    if (med.startDate && key < med.startDate) return false;
+    if (med.active === false) {
+      if (!med.endDate) return false;
+      if (key >= med.endDate) return false;
+    }
     return true;
-  }
-
-  function activeMedicationsOn(state, key) {
-    return (state.medications || []).filter((med) => {
-      if (med.active === false) return false;
-      if (med.startDate && key < med.startDate) return false;
-      if (med.endDate && key > med.endDate) return false;
-      return Array.isArray(med.schedule) && med.schedule.length > 0;
-    });
   }
 
   function dosesForDate(state, key) {
     const doses = [];
-    activeMedicationsOn(state, key).forEach((med) => {
+    (state.medications || []).filter((med) => medicationAppliesOn(med, key) && Array.isArray(med.schedule) && med.schedule.length > 0).forEach((med) => {
       med.schedule.forEach((dose) => {
         const logKey = `${med.id}|${dose.time}`;
         const logged = Boolean(state.medLogs && state.medLogs[key] && state.medLogs[key][logKey]);
@@ -696,6 +965,20 @@
     return doses.sort((a, b) => a.time.localeCompare(b.time));
   }
 
+  function isDoseDue(dose, key) {
+    if (key < todayKey()) return true;
+    if (key > todayKey()) return false;
+    const now = new Date();
+    const currentMinutes = now.getHours() * 60 + now.getMinutes();
+    const [hours, minutes] = String(dose.time || '').split(':').map(Number);
+    if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return true;
+    return hours * 60 + minutes <= currentMinutes;
+  }
+
+  function dueDosesForDate(state, key) {
+    return dosesForDate(state, key).filter((dose) => isDoseDue(dose, key));
+  }
+
   function adherence(state, days) {
     const span = days || 14;
     const today = todayKey();
@@ -706,13 +989,13 @@
       if (!med.startDate) return min;
       return !min || med.startDate < min ? med.startDate : min;
     }, null);
-    if (!earliest) return { rate: null, taken: 0, scheduled: 0, days: span };
+    if (!earliest) return { rate: null, taken: 0, scheduled: 0, days: span, loggedDays: 0 };
     for (let i = span - 1; i >= 0; i -= 1) {
       const key = dateKey(addDays(today, -i));
       if (key < earliest) continue;
-      const doses = dosesForDate(state, key);
+      const doses = dueDosesForDate(state, key);
       if (!doses.length) continue;
-      if (state.medLogs && state.medLogs[key] && Object.keys(state.medLogs[key]).length) loggedDays += 1;
+      if (state.medLogs && state.medLogs[key] && doses.some((dose) => dose.taken)) loggedDays += 1;
       doses.forEach((dose) => {
         scheduled += 1;
         if (dose.taken) taken += 1;
@@ -728,7 +1011,7 @@
     const output = [];
     for (let i = span - 1; i >= 0; i -= 1) {
       const key = dateKey(addDays(today, -i));
-      const doses = dosesForDate(state, key);
+      const doses = dueDosesForDate(state, key);
       const taken = doses.filter((d) => d.taken).length;
       output.push({
         date: key,
@@ -740,11 +1023,18 @@
     return output;
   }
 
-  function upcomingVisit(state) {
+  function upcomingVisits(state) {
     const today = todayKey();
     return (state.visits || [])
       .filter((v) => v.date >= today)
-      .sort((a, b) => a.date.localeCompare(b.date))[0] || null;
+      .sort((a, b) => {
+        if (a.date === b.date) return String(a.time || '').localeCompare(String(b.time || ''));
+        return a.date.localeCompare(b.date);
+      });
+  }
+
+  function upcomingVisit(state) {
+    return upcomingVisits(state)[0] || null;
   }
 
   function pastVisits(state) {
@@ -793,7 +1083,6 @@
   function buildSignals(state, limit) {
     const signals = [];
     const latest = latestRecord(state);
-    const previous = latest ? previousRecord(state, latest) : null;
     const today = todayKey();
 
     // Safety flags from daily logs.
@@ -808,44 +1097,52 @@
       });
     }
 
-    // Safety labs.
-    if (latest) {
-      const wbc = getValue(latest, 'WBC');
-      const anc = getValue(latest, 'ANC');
-      const alt = getValue(latest, 'ALT');
-      const ast = getValue(latest, 'AST');
-      const wbcRef = getReference(latest, 'WBC');
-      const ancRef = getReference(latest, 'ANC');
-      const altRef = getReference(latest, 'ALT');
-      const astRef = getReference(latest, 'AST');
-      const lowBlood = (wbc !== null && wbc < wbcRef.low) || (anc !== null && anc < ancRef.low);
-      const liverHigh = (alt !== null && alt > altRef.high * 3) || (ast !== null && ast > astRef.high * 3);
-      if (lowBlood) {
+    // Safety labs are looked up per indicator, so a newer TSH-only record does
+    // not hide an earlier abnormal blood count or liver result.
+    const recentSafety = {};
+    ['WBC', 'ANC', 'ALT', 'AST'].forEach((key) => {
+      const record = recordsWithIndicator(state, key)[0];
+      if (!record) return;
+      const age = daysBetween(record.date, today);
+      if (age === null || age > 120) return;
+      recentSafety[key] = {
+        record,
+        value: getValue(record, key),
+        reference: getReference(record, key)
+      };
+    });
+    const lowBloodKeys = ['WBC', 'ANC'].filter((key) => {
+      const item = recentSafety[key];
+      return item && item.value !== null && item.value < item.reference.low;
+    });
+    const highLiverKeys = ['ALT', 'AST'].filter((key) => {
+      const item = recentSafety[key];
+      return item && item.value !== null && item.value > item.reference.high * 3;
+    });
+    if (lowBloodKeys.length || highLiverKeys.length) {
+      const parts = [];
+      if (lowBloodKeys.length) {
+        parts.push(`血常规：${lowBloodKeys.map((key) => `${key} ${formatNumber(recentSafety[key].value, key)} ${INDICATORS[key].unit}（${formatMonthDay(recentSafety[key].record.date)}）`).join('、')} 低于参考范围`);
+      }
+      if (highLiverKeys.length) {
+        parts.push(`肝酶：${highLiverKeys.map((key) => `${key} ${formatNumber(recentSafety[key].value, key)} ${INDICATORS[key].unit}（${formatMonthDay(recentSafety[key].record.date)}）`).join('、')} 明显高于参考上限`);
+      }
+      signals.push({
+        tone: 'danger', kind: 'safety-lab',
+        title: '最近的用药安全指标需要尽快关注',
+        text: `按你录入的参考范围，${parts.join('；')}。若正在服用抗甲状腺药物，请尽快联系医生并按医嘱复查；不要自行调整或停用药物。`,
+        action: '查看检查记录', route: 'records'
+      });
+    } else {
+      const onATD = (state.medications || []).some((med) => med.active !== false && med.category === '抗甲状腺药');
+      const hasRecentSafety = Object.keys(recentSafety).length > 0;
+      if (onATD && !hasRecentSafety) {
         signals.push({
-          tone: 'danger', kind: 'safety-lab',
-          title: '血常规指标低于参考范围',
-          text: '按你录入的参考范围，白细胞或中性粒细胞低于下限。若正在服用抗甲状腺药物，请尽快联系医生并按医嘱复查；不要自行调整或停用药物。',
-          action: '查看检查记录', route: 'records'
+          tone: 'info', kind: 'safety-gap',
+          title: '用药安全指标可以顺便记录',
+          text: '正在服用抗甲状腺药物时，医生可能会安排血常规和肝功能监测。复查后可以在「检查记录」中一起录入，方便下次就诊时回看。',
+          action: '了解监测要点', route: 'learn'
         });
-      } else if (liverHigh) {
-        signals.push({
-          tone: 'danger', kind: 'safety-lab',
-          title: '肝酶明显高于参考上限',
-          text: '请尽快联系医生评估，并带上这张化验单。是否与药物有关、如何处理，需由医生结合症状与其他检查判断。',
-          action: '查看检查记录', route: 'records'
-        });
-      } else {
-        const wbcAge = latest.date ? daysBetween(latest.date, today) : null;
-        const hasSafety = wbc !== null || anc !== null || alt !== null || ast !== null;
-        const onATD = (state.medications || []).some((m) => m.active !== false && m.category === '抗甲状腺药');
-        if (onATD && (!hasSafety || (wbcAge !== null && wbcAge > 120))) {
-          signals.push({
-            tone: 'info', kind: 'safety-gap',
-            title: '用药安全指标可以顺便记录',
-            text: '正在服用抗甲状腺药物时，医生可能会安排血常规和肝功能监测。复查后可以在「检查记录」中一起录入，方便下次就诊时回看。',
-            action: '了解监测要点', route: 'learn'
-          });
-        }
       }
     }
 
@@ -967,12 +1264,17 @@
   }
 
   function validateImportedState(raw) {
-    if (!raw || typeof raw !== 'object') return { ok: false, message: '文件内容不是有效的数据格式。' };
+    if (!isPlainObject(raw)) return { ok: false, message: '文件内容不是有效的数据格式。' };
     if (!Array.isArray(raw.records) || !Array.isArray(raw.daily) || !Array.isArray(raw.medications)) {
       return { ok: false, message: '缺少必要的记录字段，可能不是蝶迹的备份文件。' };
     }
-    if (!raw.profile || typeof raw.profile !== 'object') {
+    if (!isPlainObject(raw.profile)) {
       return { ok: false, message: '备份中缺少个人档案信息。' };
+    }
+    const normalized = normalizeState(raw);
+    if (!normalized) return { ok: false, message: '备份数据无法读取。' };
+    if (raw.records.length > 0 && normalized.records.length === 0) {
+      return { ok: false, message: '备份中的检查记录格式无法识别，未导入任何数据。' };
     }
     return { ok: true };
   }
@@ -984,21 +1286,20 @@
   };
 
   JK.utils = {
-    pad, dateKey, todayKey, fromDateKey, addDays, daysBetween, relativeDayLabel,
-    formatDate, formatDateShort, formatMonthDay, weekdayCN, englishMonth,
+    pad, dateKey, todayKey, fromDateKey, isValidDateKey, addDays, daysBetween,
+    formatDate, formatMonthDay, weekdayCN, englishMonth,
     formatNumber, formatRange, uid, clamp, estimateBytes
   };
 
   JK.data = {
     createEmptyState, normalizeState, buildDemoState, loadState, saveState,
-    clearStoredState, defaultRanges, validateImportedState
+    getLoadStateIssue, getRecoveryRaw, clearRecovery, defaultRanges, validateImportedState
   };
 
   JK.model = {
     sortedRecords, latestRecord, previousRecord, getEntry, getValue, getReference,
     getStatus, entryStatus, statusCopy, statusTone, seriesFor, recordsWithIndicator,
-    latestDaily, dailySeries, symptomLoad, symptomCount, activeMedicationsOn,
-    dosesForDate, adherence, medLogSeries, upcomingVisit, pastVisits, age,
-    corePanelSummary, recentFlags, buildSignals, dateIsBetween
+    latestDaily, dailySeries, dosesForDate, adherence, medLogSeries, upcomingVisit,
+    upcomingVisits, pastVisits, age, corePanelSummary, recentFlags, buildSignals
   };
 })();
